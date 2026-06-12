@@ -1,0 +1,9 @@
+# Jenkins + ArgoCD + Harbor 部署 Playbook
+# 适用: K3s ARM64 OL9 集群
+# 执行: ansible-playbook -i inventory/oci.ini ci-cd.yml
+
+- name: Deploy CI/CD Stack (Jenkins + ArgoCD + Harbor)
+  hosts: server
+  gather_facts: true
+  roles:
+    - ci_cd

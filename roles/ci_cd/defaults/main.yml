@@ -1,0 +1,187 @@
+---
+# === 域名 ===
+jenkins_host: "jenkins.mayflai.dpdns.org"
+argocd_host:  "argocd.mayflai.dpdns.org"
+harbor_host:  "registry.mayflai.dpdns.org"
+
+# === Helm Chart 版本 ===
+jenkins_chart_version: "5.8.18"
+argocd_chart_version:  "7.8.15"
+harbor_chart_version:  "1.16.2"
+
+# ============================================================
+# Jenkins Helm Values
+# ============================================================
+jenkins_values:
+  controller:
+    image:
+      registry: "docker.io"
+      repository: "jenkins/jenkins"
+      tag: "lts-jdk21"
+      tagLabel: "jdk21"
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+    ingress:
+      enabled: false
+    serviceType: ClusterIP
+    installPlugins:
+      - "kubernetes"
+      - "workflow-aggregator"
+      - "git"
+      - "configuration-as-code"
+      - "blueocean"
+      - "docker-plugin"
+      - "pipeline-stage-view"
+  persistence:
+    enabled: true
+    size: 20Gi
+  agent:
+    enabled: true
+    image:
+      registry: "docker.io"
+      repository: "jenkins/inbound-agent"
+      tag: "latest-jdk21"
+
+# ============================================================
+# ArgoCD Helm Values
+# ============================================================
+argocd_values:
+  global:
+    domain: "argocd.mayflai.dpdns.org"
+  configs:
+    params:
+      server.insecure: true
+  server:
+    ingress:
+      enabled: false
+    service:
+      type: ClusterIP
+  redis:
+    architecture: standalone
+  controller:
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+  repoServer:
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+
+# ============================================================
+# Harbor Helm Values
+# ============================================================
+harbor_values:
+  expose:
+    type: ingress
+    tls:
+      enabled: false
+    ingress:
+      controller: default
+      hosts:
+        core: "registry.mayflai.dpdns.org"
+        notary: "notary.mayflai.dpdns.org"
+  externalURL: "https://registry.mayflai.dpdns.org"
+  persistence:
+    enabled: true
+    persistentVolumeClaim:
+      registry:
+        size: 50Gi
+      jobservice:
+        jobLog:
+          size: 1Gi
+  notary:
+    enabled: false
+  trivy:
+    enabled: false
+  chartmuseum:
+    enabled: false
+
+# ============================================================
+# IngressRoute + Certificate 资源模板
+# ============================================================
+
+jenkins_ingress:
+  apiVersion: traefik.io/v1alpha1
+  kind: IngressRoute
+  metadata:
+    name: jenkins
+    namespace: jenkins
+  spec:
+    entryPoints:
+      - websecure
+    routes:
+      - kind: Rule
+        match: "Host(`jenkins.mayflai.dpdns.org`)"
+        services:
+          - name: jenkins
+            port: 8080
+    tls:
+      secretName: mayflai-tls
+
+argocd_cert:
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: argocd-tls
+    namespace: argocd
+  spec:
+    secretName: argocd-tls
+    issuerRef:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
+    dnsNames:
+      - "argocd.mayflai.dpdns.org"
+
+argocd_ingress:
+  apiVersion: traefik.io/v1alpha1
+  kind: IngressRoute
+  metadata:
+    name: argocd
+    namespace: argocd
+  spec:
+    entryPoints:
+      - websecure
+    routes:
+      - kind: Rule
+        match: "Host(`argocd.mayflai.dpdns.org`)"
+        services:
+          - name: argocd-server
+            port: 80
+    tls:
+      secretName: argocd-tls
+
+harbor_cert:
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: registry-tls
+    namespace: harbor
+  spec:
+    secretName: registry-tls
+    issuerRef:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
+    dnsNames:
+      - "registry.mayflai.dpdns.org"
+
+harbor_ingress:
+  apiVersion: traefik.io/v1alpha1
+  kind: IngressRoute
+  metadata:
+    name: harbor
+    namespace: harbor
+  spec:
+    entryPoints:
+      - websecure
+    routes:
+      - kind: Rule
+        match: "Host(`registry.mayflai.dpdns.org`)"
+        services:
+          - name: harbor
+            port: 80
+    tls:
+      secretName: registry-tls

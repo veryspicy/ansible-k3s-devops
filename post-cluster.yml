@@ -1,0 +1,17 @@
+---
+# post-cluster.yml — K3s 集群后置部署
+# 在 k3s-ansible 执行完毕后运行，统一通过 Helm 部署 cert-manager 及 K8s 资源
+#
+# 用法（WSL 本地执行，经跳板机穿透）:
+#   cd /root/tf/ansible
+#   ansible-playbook -i inventory/oci.ini post-cluster.yml
+#
+# 前置条件:
+#   1. k3s-ansible/site.yml 已执行完毕
+#   2. group_vars/all.yml 中已配置 cloudflare_api_token
+
+- name: K3s 集群后置部署
+  hosts: server
+  gather_facts: true
+  roles:
+    - post_cluster

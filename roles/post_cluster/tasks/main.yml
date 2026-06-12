@@ -1,0 +1,183 @@
+---
+# post_cluster role — Helm 部署 cert-manager + K8s 资源
+# 纯 kubectl/helm 实现，无 Python K8s 模块依赖
+
+- name: 检查并安装 Helm (ARM64)
+  block:
+    - name: 检查是否已安装 Helm
+      ansible.builtin.command: which helm
+      register: helm_check
+      failed_when: false
+      changed_when: false
+
+    - name: 下载 Helm ARM64 二进制
+      ansible.builtin.get_url:
+        url: https://get.helm.sh/helm-v3.16.2-linux-arm64.tar.gz
+        dest: /tmp/helm-arm64.tar.gz
+        mode: '0644'
+      when: helm_check.rc != 0
+
+    - name: 解压 Helm
+      ansible.builtin.unarchive:
+        src: /tmp/helm-arm64.tar.gz
+        dest: /tmp
+        remote_src: true
+      when: helm_check.rc != 0
+
+    - name: 安装 Helm 到系统路径
+      ansible.builtin.copy:
+        src: /tmp/linux-arm64/helm
+        dest: /usr/local/bin/helm
+        mode: '0755'
+        remote_src: true
+      when: helm_check.rc != 0
+
+    - name: 清理临时文件
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/helm-arm64.tar.gz
+        - /tmp/linux-arm64
+      when: helm_check.rc != 0
+
+- name: 添加 Jetstack Helm 仓库
+  ansible.builtin.command:
+    cmd: "k3s helm repo add jetstack https://charts.jetstack.io --force-update"
+  register: helm_repo
+  changed_when: "'already exists' not in helm_repo.stderr"
+
+- name: 更新 Helm 仓库
+  ansible.builtin.command:
+    cmd: k3s helm repo update
+
+- name: 部署 cert-manager (Helm)
+  ansible.builtin.command:
+    cmd: >-
+      k3s helm upgrade --install cert-manager jetstack/cert-manager
+      --namespace cert-manager --create-namespace
+      --version v1.16.1
+      --set installCRDs=true
+      --wait --timeout 5m
+  register: cm_install
+  changed_when: "'STATUS: deployed' in cm_install.stdout"
+
+- name: 等待 cert-manager Pods 就绪
+  ansible.builtin.command:
+    cmd: k3s kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=180s
+
+- name: 部署 K8s 资源 (Secret / ClusterIssuer / Certificate / whoami)
+  block:
+    - name: 生成 K8s 资源清单
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cloudflare-api-token
+            namespace: cert-manager
+          stringData:
+            api-token: "{{ cloudflare_api_token }}"
+          ---
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: "{{ cert_email }}"
+              privateKeySecretRef:
+                name: letsencrypt-prod-account-key
+              solvers:
+                - dns01:
+                    cloudflare:
+                      apiTokenSecretRef:
+                        name: cloudflare-api-token
+                        key: api-token
+          ---
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: mayflai-tls
+            namespace: default
+          spec:
+            secretName: mayflai-tls
+            issuerRef:
+              name: letsencrypt-prod
+              kind: ClusterIssuer
+            dnsNames:
+              - "{{ domain_name }}"
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: whoami
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: whoami
+            template:
+              metadata:
+                labels:
+                  app: whoami
+              spec:
+                containers:
+                  - name: whoami
+                    image: traefik/whoami:latest
+                    ports:
+                      - containerPort: 80
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: whoami
+            namespace: default
+          spec:
+            ports:
+              - port: 80
+                targetPort: 80
+            selector:
+              app: whoami
+          ---
+          apiVersion: traefik.io/v1alpha1
+          kind: IngressRoute
+          metadata:
+            name: whoami-https
+            namespace: default
+          spec:
+            entryPoints:
+              - websecure
+            routes:
+              - kind: Rule
+                match: "Host(`{{ domain_name }}`)"
+                services:
+                  - name: whoami
+                    port: 80
+            tls:
+              secretName: mayflai-tls
+        dest: /tmp/post-cluster-resources.yaml
+        mode: '0644'
+
+    - name: 应用 K8s 资源
+      ansible.builtin.command:
+        cmd: k3s kubectl apply -f /tmp/post-cluster-resources.yaml
+      register: k8s_apply
+      changed_when: "'created' in k8s_apply.stdout or 'configured' in k8s_apply.stdout"
+
+- name: 等待 TLS 证书签发
+  ansible.builtin.command:
+    cmd: >-
+      k3s kubectl wait --for=condition=ready certificate mayflai-tls -n default --timeout=300s
+
+- name: 验证部署结果
+  ansible.builtin.command:
+    cmd: k3s kubectl get pods,svc,ingressroute,certificate -n default
+  register: deploy_status
+  changed_when: false
+
+- name: 输出部署状态
+  ansible.builtin.debug:
+    var: deploy_status.stdout_lines

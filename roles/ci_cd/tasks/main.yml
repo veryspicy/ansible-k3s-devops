@@ -1,0 +1,136 @@
+---
+# CI/CD Stack 部署任务
+
+- name: 生成 Jenkins Helm values 文件
+  ansible.builtin.copy:
+    content: "{{ jenkins_values | to_nice_yaml }}"
+    dest: /tmp/jenkins-values.yaml
+
+- name: 生成 ArgoCD Helm values 文件
+  ansible.builtin.copy:
+    content: "{{ argocd_values | to_nice_yaml }}"
+    dest: /tmp/argocd-values.yaml
+
+- name: 生成 Harbor Helm values 文件
+  ansible.builtin.copy:
+    content: "{{ harbor_values | to_nice_yaml }}"
+    dest: /tmp/harbor-values.yaml
+
+- name: 生成 K8s IngressRoute / Certificate 资源文件
+  ansible.builtin.copy:
+    content: "{{ item.content | to_nice_yaml }}"
+    dest: "/tmp/{{ item.name }}.yaml"
+  loop:
+    - { name: "jenkins-ingress", content: "{{ jenkins_ingress }}" }
+    - { name: "argocd-cert",    content: "{{ argocd_cert }}" }
+    - { name: "argocd-ingress", content: "{{ argocd_ingress }}" }
+    - { name: "harbor-cert",    content: "{{ harbor_cert }}" }
+    - { name: "harbor-ingress", content: "{{ harbor_ingress }}" }
+
+- name: 确保目标命名空间存在
+  ansible.builtin.shell: |
+    for ns in jenkins argocd harbor; do
+      kubectl get namespace $ns 2>/dev/null || kubectl create namespace $ns
+    done
+  register: ns_result
+  changed_when: "'created' in ns_result.stdout"
+
+- name: 添加 Helm 仓库
+  ansible.builtin.shell: |
+    helm repo add jenkins https://charts.jenkins.io 2>/dev/null || true
+    helm repo add argo https://argoproj.github.io/argo-helm 2>/dev/null || true
+    helm repo add harbor https://helm.goharbor.io 2>/dev/null || true
+    helm repo update
+  changed_when: false
+
+- name: 部署 Jenkins (Helm)
+  ansible.builtin.shell: |
+    helm upgrade --install jenkins jenkins/jenkins \
+      --namespace jenkins \
+      --version {{ jenkins_chart_version }} \
+      --values /tmp/jenkins-values.yaml \
+      --wait --timeout 10m
+  register: jenkins_deploy
+  changed_when: "'STATUS: deployed' in jenkins_deploy.stdout or 'has been upgraded' in jenkins_deploy.stdout"
+
+- name: 部署 ArgoCD (Helm)
+  ansible.builtin.shell: |
+    helm upgrade --install argocd argo/argo-cd \
+      --namespace argocd \
+      --version {{ argocd_chart_version }} \
+      --values /tmp/argocd-values.yaml \
+      --wait --timeout 10m
+  register: argocd_deploy
+  changed_when: "'STATUS: deployed' in argocd_deploy.stdout or 'has been upgraded' in argocd_deploy.stdout"
+
+- name: 部署 Harbor (Helm)
+  ansible.builtin.shell: |
+    helm upgrade --install harbor harbor/harbor \
+      --namespace harbor \
+      --version {{ harbor_chart_version }} \
+      --values /tmp/harbor-values.yaml \
+      --wait --timeout 15m
+  register: harbor_deploy
+  changed_when: "'STATUS: deployed' in harbor_deploy.stdout or 'has been upgraded' in harbor_deploy.stdout"
+
+- name: 创建 Traefik IngressRoute + Certificate 资源
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/jenkins-ingress.yaml
+    kubectl apply -f /tmp/argocd-cert.yaml
+    kubectl apply -f /tmp/argocd-ingress.yaml
+    kubectl apply -f /tmp/harbor-cert.yaml
+    kubectl apply -f /tmp/harbor-ingress.yaml
+  changed_when: false
+
+- name: 等待所有 CI/CD Pod 就绪
+  ansible.builtin.shell: |
+    for ns in jenkins argocd harbor; do
+      kubectl wait --for=condition=ready pod --all -n $ns --timeout=300s 2>/dev/null || true
+    done
+  changed_when: false
+
+- name: 获取 Jenkins 初始密码
+  ansible.builtin.shell: |
+    kubectl exec -n jenkins deploy/jenkins -- cat /var/jenkins_home/secrets/initialAdminPassword 2>/dev/null || echo "NOT_READY_YET"
+  register: jenkins_pw
+  changed_when: false
+
+- name: 获取 ArgoCD 初始密码
+  ansible.builtin.shell: |
+    kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d || echo "NOT_READY_YET"
+  register: argocd_pw
+  changed_when: false
+
+- name: 输出部署摘要
+  ansible.builtin.debug:
+    msg: |
+      ========================================
+        CI/CD Stack 部署完成
+      ========================================
+
+      Jenkins:   https://{{ jenkins_host }}
+      初始密码:  {{ jenkins_pw.stdout }}
+
+      ArgoCD:    https://{{ argocd_host }}
+      初始密码:  {{ argocd_pw.stdout }}
+      登录命令:  argocd login {{ argocd_host }}
+
+      Harbor:    https://{{ harbor_host }}
+      登录命令:  docker login {{ harbor_host }}
+
+      ========================================
+
+- name: 清理临时文件
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/jenkins-values.yaml
+    - /tmp/argocd-values.yaml
+    - /tmp/harbor-values.yaml
+    - /tmp/jenkins-ingress.yaml
+    - /tmp/argocd-cert.yaml
+    - /tmp/argocd-ingress.yaml
+    - /tmp/harbor-cert.yaml
+    - /tmp/harbor-ingress.yaml
+  changed_when: false
